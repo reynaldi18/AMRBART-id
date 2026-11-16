@@ -31,6 +31,15 @@ def token_processing(tok):
         return tok
 
 
+def _inside_lit(tokens):
+    for t in reversed(tokens):
+        if t == "<lit>":
+            return True
+        if t == "</lit>":
+            return False
+    return False
+
+
 def decode_into_node_and_backreferences(subtoken_ids, tokenizer):
     rex_arg = re.compile(f"^{tokenizer.INIT}(op|snt|conj|prep)")
     rex_spc = re.compile(r"<(s|/s|lit|/lit|stop|unk|pad|mask)>")
@@ -95,10 +104,13 @@ def decode_into_node_and_backreferences(subtoken_ids, tokenizer):
             current_token_i += 1
 
         # very ugly patch for some cases in which tokenizer.INIT is not in the following token to the edge
+        # FIX (Rey 2026-11): decode(...).split(" ") gives whole words without INIT, so ANY word that
+        # follows a complete edge is a new token (was: only edges ending in a digit, e.g. :op1/:ARG0).
+        # Without this, ":year 2008" becomes ":year2008" and the value is lost.
         elif (
             isinstance(tokens[-1], str)
             and tokens[-1].startswith(":")
-            and tokens[-1][-1].isdigit()
+            and len(tokens[-1]) > 1
             and (subtok != "-of")
         ):
             tokens.append(subtok.lstrip(tokenizer.INIT))
@@ -122,6 +134,20 @@ def decode_into_node_and_backreferences(subtoken_ids, tokenizer):
                 current_token_i += 1
 
         elif subtok == '-':
+            tokens.append(subtok)
+            backreferences.append(-1)
+            current_token_i += 1
+
+        # FIX (Rey 2026-11): a relation that is not an added AMR token (e.g. :prep-with, :op6)
+        # arrives without INIT; it must start a new token instead of being glued to the concept.
+        elif subtok.startswith(":") and len(subtok) > 1:
+            tokens.append(subtok)
+            backreferences.append(-1)
+            current_token_i += 1
+
+        # FIX (Rey 2026-11): inside <lit> ... </lit> every word is a separate token, so the
+        # later "_".join(...) restores "Anwar_Ibrahim" instead of "AnwarIbrahim".
+        elif _inside_lit(tokens):
             tokens.append(subtok)
             backreferences.append(-1)
             current_token_i += 1
