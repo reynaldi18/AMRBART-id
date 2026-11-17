@@ -179,6 +179,7 @@ class Seq2SeqTrainer(Trainer):
         callbacks: Optional[List[TrainerCallback]] = None,
         optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         preprocess_logits_for_metrics: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = None,
+        mtl: Optional[dict] = None,
     ) -> None:
         super().__init__(model, args, data_collator, train_dataset, eval_dataset, tokenizer, model_init, compute_metrics, callbacks, optimizers, preprocess_logits_for_metrics)
         
@@ -190,6 +191,33 @@ class Seq2SeqTrainer(Trainer):
         self.eval_lenpen = self.args.eval_lenpen
         self.decoder_start_token_id = self.tokenizer.amr_bos_token_id if self.args.task=="text2amr" else self.tokenizer.eos_token_id
         self.decoder_end_token_id = self.tokenizer.amr_eos_token_id if self.args.task=="text2amr" else self.tokenizer.eos_token_id
+        # MTL (M3/M4): None pada M1/M2 -> semua cabang di bawah tidak aktif
+        self.mtl = mtl
+        self._mtl_reset_acc()
+
+    # ------------------------------ MTL ------------------------------
+    def _mtl_reset_acc(self):
+        self._mtl_acc = None
+        self._mtl_n = 0
+
+    def _mtl_encoder_scale(self):
+        w = self.mtl["lambda_warmup"]
+        return 1.0 if w <= 0 else min(1.0, self.state.global_step / float(w))
+
+    def log(self, logs):
+        if self.mtl is not None and "loss" in logs and self._mtl_n > 0:
+            a = (self._mtl_acc / self._mtl_n).tolist()
+            tot = self._mtl_tot.tolist()
+            logs["loss_amr"] = round(a[0], 4)
+            logs["loss_dep"] = round(a[1], 4)
+            logs["dep_arc_loss"] = round(a[2], 4)
+            logs["dep_rel_loss"] = round(a[3], 4)
+            logs["dep_uas"] = round(tot[0] / max(tot[2], 1.0), 4)
+            logs["dep_las"] = round(tot[1] / max(tot[2], 1.0), 4)
+            logs["mtl_lambda"] = self.mtl["lambda"]
+            logs["mtl_enc_scale"] = round(self._mtl_encoder_scale(), 4)
+            self._mtl_reset_acc()
+        super().log(logs)
         
     def create_optimizer(self):
         """
@@ -202,12 +230,15 @@ class Seq2SeqTrainer(Trainer):
 
         if self.optimizer is None:
             no_decay = ["bias", "LayerNorm.weight"]
+            # MTL: parameter head dipisah ke group dengan lr sendiri; parameter bersama tetap persis
+            # seperti M1/M2 (lr = --learning_rate). Tanpa MTL, is_head selalu False -> identik.
+            is_head = (lambda n: self.mtl is not None and n.startswith("dep_head."))
             optimizer_grouped_parameters = [
                 {
                     "params": [
                         p
                         for n, p in opt_model.named_parameters()
-                        if not any(nd in n for nd in no_decay) and p.requires_grad
+                        if not any(nd in n for nd in no_decay) and p.requires_grad and not is_head(n)
                     ],
                     "weight_decay": self.args.weight_decay,
                 },
@@ -215,11 +246,22 @@ class Seq2SeqTrainer(Trainer):
                     "params": [
                         p
                         for n, p in opt_model.named_parameters()
-                        if any(nd in n for nd in no_decay) and p.requires_grad
+                        if any(nd in n for nd in no_decay) and p.requires_grad and not is_head(n)
                     ],
                     "weight_decay": 0.0,
                 },
             ]
+            if self.mtl is not None:
+                head_decay = [p for n, p in opt_model.named_parameters()
+                              if is_head(n) and p.requires_grad and not any(nd in n for nd in no_decay)]
+                head_nodecay = [p for n, p in opt_model.named_parameters()
+                                if is_head(n) and p.requires_grad and any(nd in n for nd in no_decay)]
+                optimizer_grouped_parameters += [
+                    {"params": head_decay, "weight_decay": self.args.weight_decay, "lr": self.mtl["head_lr"]},
+                    {"params": head_nodecay, "weight_decay": 0.0, "lr": self.mtl["head_lr"]},
+                ]
+                n_head = sum(p.numel() for p in head_decay + head_nodecay)
+                print(f"[MTL] param group head: {n_head:,} parameter, lr {self.mtl['head_lr']}")
 
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
 
@@ -324,6 +366,8 @@ class Seq2SeqTrainer(Trainer):
         else:
             labels = None
 
+        if self.mtl is not None and "dep_heads" in inputs:
+            unwrap_model(model).mtl_encoder_grad_scale = self._mtl_encoder_scale()
         outputs = model(**inputs)
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.
@@ -342,6 +386,19 @@ class Seq2SeqTrainer(Trainer):
                     lprobs, labels, self.args.label_smoothing_factor, ignore_index=self.tokenizer.pad_token_id
                 )
                 # loss = self.label_smoother(outputs, labels)
+                dep_loss = outputs.get("dep_loss", None) if isinstance(outputs, dict) else None
+                if self.mtl is not None and dep_loss is not None:
+                    loss_amr = loss
+                    loss = loss_amr + self.mtl["lambda"] * dep_loss
+                    if model.training:
+                        st = outputs["dep_stats"].detach()
+                        cur = torch.stack([loss_amr.detach().float(), dep_loss.detach().float(), st[0], st[1]])
+                        if self._mtl_acc is None:
+                            self._mtl_acc = torch.zeros_like(cur)
+                            self._mtl_tot = torch.zeros(3, device=cur.device)
+                        self._mtl_acc += cur
+                        self._mtl_tot += st[2:5]
+                        self._mtl_n += 1
         else:
             if isinstance(outputs, dict) and "loss" not in outputs:
                 raise ValueError(

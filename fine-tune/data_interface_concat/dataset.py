@@ -8,6 +8,10 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from typing import Optional, Union
 from common.utils import shift_tokens_right
+from common.mtl_config import get_mtl_config
+from data_interface_concat.dep_align import align_example, IGNORE as DEP_IGNORE
+import json
+import hashlib
 
 
 def padding_func(features, padding_side="right", pad_token_id=1, key="label", pad_to_multiple_of=1, max_length=None):
@@ -75,6 +79,33 @@ class AMRParsingDataSet(Dataset):
             "test": {"token_count": 0, "data_count": 0},
         }
 
+        # ---- MTL (M3/M4): label dependensi dari berkas pendamping, HANYA untuk split train ----
+        self.mtl = get_mtl_config(self.train_file) if self.train_file else None
+        self.dep_stats = {}
+        if self.mtl is not None and "train" in self.datasets:
+            self._attach_dep_column()
+
+    def _attach_dep_column(self):
+        cfg = self.mtl
+        rel2id = {r: i for i, r in enumerate(cfg["labels"])}
+        ens = self.datasets["train"]["en"]
+        rows = []
+        with open(cfg["dep_file"], encoding="utf-8") as f:
+            for n, line in enumerate(f):
+                d = json.loads(line)
+                if n >= len(ens):
+                    raise ValueError(f"{cfg['dep_file']} lebih panjang dari data train ({len(ens)} baris)")
+                h = hashlib.md5(ens[n].encode("utf-8")).hexdigest()[:12]
+                if d["i"] != n or d["h"] != h:
+                    raise ValueError(f"{cfg['dep_file']} baris {n} tidak cocok dengan train.jsonl "
+                                     f"(i={d['i']}, hash {d['h']} != {h})")
+                rows.append([[w[0], w[1], w[2], rel2id.get(w[3], -1)] for w in d["w"]])
+        if len(rows) != len(ens):
+            raise ValueError(f"{cfg['dep_file']} {len(rows)} baris, train {len(ens)} baris")
+        self.datasets["train"] = self.datasets["train"].add_column("dep_w", rows)
+        print(f"[MTL] label dependensi dipasang: {len(rows)} kalimat, {cfg['n_rels']} label, "
+              f"dari {cfg['dep_file']}")
+
     def create_tokenize_function(self, dataset_type):
         trim_counts = self.trim_counts[dataset_type]
         def tokenize_function(examples):
@@ -97,10 +128,20 @@ class AMRParsingDataSet(Dataset):
                 txt_ids = [itm[:self.max_src_length-3] + [self.tokenizer.amr_bos_token_id, self.tokenizer.mask_token_id, self.tokenizer.amr_eos_token_id] for itm in raw_txt_ids]
             else:
                 txt_ids = raw_txt_ids
-            return {
+            out = {
                 "input_ids": txt_ids,
                 "labels": amr_ids
             }
+            if "dep_w" in examples:
+                en_id = self.tokenizer.lang_code_to_id["en_XX"]
+                dh, dr = [], []
+                for ids_, en, words in zip(txt_ids, ens, examples["dep_w"]):
+                    h_, r_ = align_example(ids_, en, words, self.tokenizer, en_id, stats=self.dep_stats)
+                    dh.append(h_)
+                    dr.append(r_)
+                out["dep_heads"] = dh
+                out["dep_rels"] = dr
+            return out
         
         return tokenize_function
 
@@ -155,6 +196,11 @@ class DataCollatorForAMRParsing:
             key="labels",
             pad_to_multiple_of=self.pad_to_multiple_of,
         )
+
+        # MTL: label dependensi dipisah dulu (tokenizer.pad tidak bisa mem-pad kunci lain)
+        dep = None
+        if "dep_heads" in features[0]:
+            dep = ([f.pop("dep_heads") for f in features], [f.pop("dep_rels") for f in features])
         
         features = self.tokenizer.pad(
             features,
@@ -171,11 +217,21 @@ class DataCollatorForAMRParsing:
             decoder_start_token_id=self.tokenizer.amr_bos_token_id,
         )
 
-        return {
+        batch = {
             "input_ids": features["input_ids"],
             "labels": features["labels"],
             "decoder_input_ids": features["decoder_input_ids"],
         }
+        if dep is not None:
+            import torch
+            T = features["input_ids"].shape[1]
+            for key, seqs in zip(("dep_heads", "dep_rels"), dep):
+                t = torch.full((len(seqs), T), DEP_IGNORE, dtype=torch.long)
+                for b, s in enumerate(seqs):
+                    s = list(s)[:T]
+                    t[b, : len(s)] = torch.tensor(s, dtype=torch.long)
+                batch[key] = t
+        return batch
         
 
 class AMR2TextDataSet(Dataset):

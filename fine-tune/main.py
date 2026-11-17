@@ -19,6 +19,7 @@ from model_interface.modeling_bart import MBartForConditionalGeneration as BartF
 from model_interface.tokenization_bart import AMRBartTokenizer
 from common.options import DataTrainingArguments, ModelArguments, Seq2SeqTrainingArguments
 from common.utils import smart_emb_init, calculate_smatch
+from common.mtl_config import get_mtl_config
 from filelock import FileLock
 from transformers import (
     AutoConfig,
@@ -137,7 +138,22 @@ def main():
         use_auth_token=True if model_args.use_auth_token else None,
     )
 
-    model = BartForConditionalGeneration.from_pretrained(
+    # ---- MTL (M3/M4): kelas model dengan head dependensi; tanpa MTL=1 jalur ini tidak aktif ----
+    mtl = get_mtl_config(data_args.train_file) if training_args.do_train else None
+    ModelClass = BartForConditionalGeneration
+    if mtl is not None:
+        from model_interface.modeling_mtl import MBartForAMRParsingMTL
+        if training_args.label_smoothing_factor <= 0:
+            raise ValueError("MTL hanya diimplementasikan di jalur label smoothing (train_m1.sh memakai 0.1)")
+        ModelClass = MBartForAMRParsingMTL
+        config.mtl_n_rels = mtl["n_rels"]
+        config.mtl_arc_dim = mtl["arc_dim"]
+        config.mtl_rel_dim = mtl["rel_dim"]
+        config.mtl_dropout = mtl["dropout"]
+        print(f"[MTL] aktif: lambda {mtl['lambda']}, warm-up {mtl['lambda_warmup']} step, "
+              f"lr head {mtl['head_lr']}, {mtl['n_rels']} label")
+
+    model = ModelClass.from_pretrained(
         model_args.model_name_or_path,
         from_tf=bool(".ckpt" in model_args.model_name_or_path),
         config=config,
@@ -200,6 +216,8 @@ def main():
     raw_datasets = DataSetCate(tokenizer, data_args, model_args)
 
     column_names = raw_datasets.datasets["train"].column_names
+    # kolom per split: pada MTL hanya train yang punya `dep_w` (pada M1/M2 isinya sama persis)
+    split_columns = {k: raw_datasets.datasets[k].column_names for k in raw_datasets.datasets}
 
     if training_args.do_train:
         if "train" not in raw_datasets.datasets:
@@ -215,7 +233,7 @@ def main():
                     raw_datasets.create_tokenize_function("train"),
                     batched=True,
                     num_proc=data_args.preprocessing_num_workers,
-                    remove_columns=column_names,
+                    remove_columns=split_columns["train"],
                     load_from_cache_file=not data_args.overwrite_cache,
                     desc="Running tokenizer on train dataset",
                 )
@@ -223,6 +241,21 @@ def main():
                 train_dataset.save_to_disk(data_args.data_cache_dir + "/train")
         else:
             train_dataset = load_from_disk(data_args.data_cache_dir + "/train", keep_in_memory=True)
+        # cache train harus cocok dengan mode: MTL wajib punya dep_heads, baseline wajib tidak
+        has_dep = "dep_heads" in train_dataset.column_names
+        if has_dep != (mtl is not None):
+            raise ValueError(
+                f"Cache train {data_args.data_cache_dir}/train {'BERISI' if has_dep else 'TIDAK berisi'} "
+                f"label dependensi, tapi MTL={'1' if mtl is not None else '0'}. Hapus cache itu atau "
+                "periksa variabel MTL.")
+        if mtl is not None:
+            st = getattr(raw_datasets, "dep_stats", {})
+            if st:
+                print("[MTL] statistik perataan:", json.dumps(st))
+                with open(os.path.join(training_args.output_dir, "dep_align_stats.json"), "w") as f:
+                    json.dump(st, f, indent=1)
+            with open(os.path.join(training_args.output_dir, "mtl_config.json"), "w") as f:
+                json.dump({k: v for k, v in mtl.items() if k != "labels"}, f, indent=1)
 
     if training_args.do_eval:
         max_target_length = data_args.val_max_target_length
@@ -238,7 +271,7 @@ def main():
                     raw_datasets.create_tokenize_function("valid"),
                     batched=True,
                     num_proc=data_args.preprocessing_num_workers,
-                    remove_columns=column_names,
+                    remove_columns=split_columns["validation"],
                     load_from_cache_file=not data_args.overwrite_cache,
                     desc="Running tokenizer on validation dataset",
                 )
@@ -261,7 +294,7 @@ def main():
                     raw_datasets.create_tokenize_function("test"),
                     batched=True,
                     num_proc=data_args.preprocessing_num_workers,
-                    remove_columns=column_names,
+                    remove_columns=split_columns["test"],
                     load_from_cache_file=not data_args.overwrite_cache,
                     desc="Running tokenizer on prediction dataset",
                 )
@@ -424,6 +457,7 @@ def main():
         data_collator=data_collator,
         callbacks=[es_callback],
         compute_metrics=compute_metrics if training_args.predict_with_generate else None,
+        mtl=mtl,
     )
 
     # Training
